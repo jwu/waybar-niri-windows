@@ -1,6 +1,10 @@
 package niri
 
-import "testing"
+import (
+	"sync"
+	"testing"
+	"time"
+)
 
 func strptr(s string) *string { return &s }
 
@@ -131,5 +135,45 @@ func TestWindowPointerStaysLive(t *testing.T) {
 	}
 	if got := *before.Title; got != "new title" {
 		t.Fatalf("captured pointer not updated: got %q", got)
+	}
+}
+
+// Update used to run the registered callbacks while still holding s.mu for
+// reading. A callback that takes a lock of its own then deadlocks against a
+// concurrent RemoveOnUpdate issued while that same lock is held, which is
+// exactly what the waybar module does in Notify and Deinit.
+func TestUpdateDoesNotHoldLockDuringCallbacks(t *testing.T) {
+	state := NewNiriState()
+
+	// stands in for module.Instance and its mutex
+	var instance sync.RWMutex
+	state.OnUpdate(1, func(*State) {
+		instance.RLock()
+		defer instance.RUnlock()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 1000 {
+			// Must be an event that needs a redraw, otherwise the notification
+			// gate below skips the callbacks and nothing is exercised.
+			go state.Update(&WindowClosed{Id: 1})
+
+			instance.Lock()
+			state.RemoveOnUpdate(1)
+			instance.Unlock()
+
+			state.OnUpdate(1, func(*State) {
+				instance.RLock()
+				defer instance.RUnlock()
+			})
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("deadlock: Update callbacks ran while the state lock was held")
 	}
 }

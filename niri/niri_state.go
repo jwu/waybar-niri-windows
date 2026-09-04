@@ -48,29 +48,31 @@ func (s *State) RemoveOnUpdate(id uint64) {
 
 func (s *State) Update(event Event) {
 	defer func() {
+		// Snapshot the callbacks and release the lock before running them:
+		// callbacks take locks of their own (e.g. the module instance lock),
+		// and a concurrent Deinit holding that lock waits for s.mu, which
+		// deadlocks if the callbacks run while s.mu is still held.
 		s.mu.RLock()
-		defer s.mu.RUnlock()
-
-		// Only notify the modules when this event actually changed something
-		// they draw. Without this gate every event (including a window title
-		// being re-set, a keyboard-layout switch, a config reload, ...) queued
-		// a rebuild, and Instance.Update() destroys and recreates every tile.
-		// Recreating the tile under the cursor drops its GTK :hover prelight,
-		// which is what a title spinner in a terminal turns into visible
-		// flicker.
 		if !s.needsRedraw {
+			// Only notify the modules when this event actually changed
+			// something they draw. Without this gate every event (including a
+			// window title being re-set, a keyboard-layout switch, a config
+			// reload, ...) queued a rebuild, and Instance.Update() destroys and
+			// recreates every tile. Recreating the tile under the cursor drops
+			// its GTK :hover prelight, which is what a title spinner in a
+			// terminal turns into visible flicker.
+			s.mu.RUnlock()
 			return
 		}
-
 		callbacks := make([]func(*State), 0, len(s.onUpdate))
 		for _, f := range s.onUpdate {
 			callbacks = append(callbacks, f)
 		}
-		defer func() {
-			for _, f := range callbacks {
-				f(s)
-			}
-		}()
+		s.mu.RUnlock()
+
+		for _, f := range callbacks {
+			f(s)
+		}
 	}()
 
 	s.mu.Lock()
