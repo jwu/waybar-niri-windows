@@ -50,6 +50,18 @@ func (s *State) Update(event Event) {
 	defer func() {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
+
+		// Only notify the modules when this event actually changed something
+		// they draw. Without this gate every event (including a window title
+		// being re-set, a keyboard-layout switch, a config reload, ...) queued
+		// a rebuild, and Instance.Update() destroys and recreates every tile.
+		// Recreating the tile under the cursor drops its GTK :hover prelight,
+		// which is what a title spinner in a terminal turns into visible
+		// flicker.
+		if !s.needsRedraw {
+			return
+		}
+
 		callbacks := make([]func(*State), 0, len(s.onUpdate))
 		for _, f := range s.onUpdate {
 			callbacks = append(callbacks, f)

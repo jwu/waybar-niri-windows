@@ -87,6 +87,35 @@ func TestFocusChangeNeedsRedraw(t *testing.T) {
 	}
 }
 
+// The actual anti-flicker guarantee: modules are only notified when the event
+// changed something they draw.
+func TestCallbacksOnlyFireForDrawingRelevantEvents(t *testing.T) {
+	s := NewNiriState()
+	s.Update(&WindowOpenedOrChanged{Window: *windowFixture()})
+
+	var calls int
+	s.OnUpdate(1, func(*State) { calls++ })
+
+	title := windowFixture()
+	title.Title = strptr("⠙ π - jwu")
+	s.Update(&WindowOpenedOrChanged{Window: *title})
+	if calls != 0 {
+		t.Fatalf("title-only change notified modules %d time(s)", calls)
+	}
+
+	s.Update(&KeyboardLayoutsChanged{})
+	if calls != 0 {
+		t.Fatalf("unrelated event notified modules %d time(s)", calls)
+	}
+
+	moved := windowFixture()
+	moved.Layout.PosInScrollingLayout = &Vec2[uint32]{X: 2, Y: 1}
+	s.Update(&WindowOpenedOrChanged{Window: *moved})
+	if calls != 1 {
+		t.Fatalf("relevant change notified modules %d time(s), want 1", calls)
+	}
+}
+
 // Tile tooltips capture the *Window pointer, so in-place updates must keep it.
 func TestWindowPointerStaysLive(t *testing.T) {
 	s := NewNiriState()
