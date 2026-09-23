@@ -2,9 +2,10 @@
 # Build the patched waybar-niri-windows module and install it.
 #
 # The source is upstream calico32/waybar-niri-windows plus local commits on top
-# (see `git log`). To pick up a new upstream release:
+# (see `git log`). Remotes: `origin` = jwu/waybar-niri-windows (your fork),
+# `upstream` = calico32/waybar-niri-windows. To pick up a new upstream release:
 #
-#   git fetch origin && git rebase origin/main   # resolve conflicts if any
+#   git fetch upstream && git rebase upstream/main
 #
 # Usage: ./build-and-install.sh
 set -euo pipefail
