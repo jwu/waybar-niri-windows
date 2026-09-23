@@ -22,7 +22,6 @@ package procs
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -37,57 +36,74 @@ const procRoot = "/proc"
 // standard library has no way to ask the kernel for it.
 const clkTck = 100
 
-// Level is how recently a process tree was working.
+// Level is how hard a process tree is working, now or a moment ago.
 type Level uint8
 
 const (
 	// Idle means the tree has not worked for the whole memory of the score,
-	// about six seconds at the default tick.
+	// about ten seconds at the default tick.
 	Idle Level = iota
-	// Warm means it worked recently, but is not working hard.
-	Warm
-	// Busy means it is working now, or was working a few seconds ago.
-	Busy
+	// Light means it is doing something small, or did a moment ago.
+	Light
+	// Medium means it is working, but not saturating a core.
+	Medium
+	// Heavy means it is using more than a whole core, or a comparable amount
+	// of disk.
+	Heavy
 )
 
 // String names the level. The module uses it as the CSS class of a tile;
 // Idle is the absence of class, so it has no rule of its own.
 func (l Level) String() string {
 	switch l {
-	case Busy:
-		return "busy"
-	case Warm:
-		return "warm"
+	case Heavy:
+		return "heavy"
+	case Medium:
+		return "medium"
+	case Light:
+		return "light"
 	default:
 		return "idle"
 	}
 }
 
-// The score is normalised so that a tree sitting exactly at one of these
-// thresholds sustains 1.0. busyEnter therefore has to be below 1.0: a score
-// that decays towards its input only approaches it asymptotically.
+// One unit of score: a whole core, or 20 MiB/s of block traffic. Each signal
+// is divided by its own unit, so the tiers below are the same numbers for
+// either of them.
 const (
-	// busyCPU is the sustained load, as a fraction of one core, that counts as
-	// working hard. A build on several cores goes far above it within one
-	// sample; a browser tab playing a video stays around 10%.
-	busyCPU = 0.15
-	// busyIO is the block traffic that counts as working hard.
-	busyIO = 5 << 20 // bytes per second
+	unitCPU = 1.0      // cores per unit
+	unitIO  = 20 << 20 // bytes per second per unit
+)
 
-	// heatDecay is how much of the score survives one sample. The score is capped,
-	// so the memory of the tracker does not grow with the size of the burst: a tree
-	// that stops working is Warm for about five seconds and Idle after six, whether
-	// it was a full core for a moment or eight cores for a minute.
-	heatDecay = 0.65
+// The tier boundaries on that score, in units, plus the hysteresis that keeps a
+// tree sitting on a boundary from flapping between two classes: every change
+// costs a repaint, and a bar that flickers is worse than one that is a second
+// late. Each exit sits more than one decay step below its enter, so a single
+// quiet sample cannot drop the level.
+//
+//	grey   0.03 and below  under 3% of a core, or 0.6 MiB/s on disk
+//	green  0.03 - 0.2      3% to 20% of a core
+//	yellow 0.2 - 1.5       20% of a core up to one and a half cores
+//	red    1.5 and up      more than one and a half cores, or 30 MiB/s
+//
+// The boundaries are deliberately at fractional loads that real work does not
+// sit on: a single-threaded task is one whole core, which is comfortably
+// yellow, and it would flicker if the boundary sat at exactly one. A tree that
+// does sit exactly on a boundary stays in the lower tier, because a score that
+// approaches its input never quite reaches it.
+const (
+	lightEnter, lightExit   = 0.03, 0.02
+	mediumEnter, mediumExit = 0.2, 0.1
+	heavyEnter, heavyExit   = 1.5, 0.8
 
-	// busyEnter leaves Idle, busyExit leaves Busy again: the gap between them
-	// is the hysteresis band that keeps a tree at the threshold from flapping
-	// between classes, since every change costs a repaint.
-	busyEnter = 0.6
-	busyExit  = 0.5
-
-	// warmEnter is the score above which a tree still counts as recently used.
-	warmEnter = 0.08
+	// heatRise is how much of a sample the score takes on while the load
+	// rises, heatFall how much of it survives a sample while the load falls.
+	// A sustained load is picked up within two or three samples and fades over
+	// about ten, and because the fall is a plain decay the memory does not grow
+	// with the size of the burst.
+	heatRise = 0.7
+	heatFall = 0.6
+	heatMax  = 4.0
 )
 
 // proc is the part of one process that this package reads.
@@ -171,22 +187,33 @@ func (r *root) advance(ticks, io uint64, dt float64) {
 
 	cpu := float64(ticks) / clkTck / dt // cores
 	rate := float64(io) / dt            // bytes per second
-	instant := math.Max(cpu/busyCPU, rate/busyIO)
+	instant := max(cpu/unitCPU, rate/unitIO)
 
-	r.heat = math.Min(r.heat*heatDecay+instant*(1-heatDecay), 1)
+	if instant > r.heat {
+		r.heat = r.heat*(1-heatRise) + instant*heatRise
+	} else {
+		r.heat *= heatFall
+	}
+	r.heat = min(r.heat, heatMax)
 	r.level = r.levelFor()
 }
 
-// levelFor maps the current score to a level, staying at Busy while the score
-// is inside the hysteresis band.
+// levelFor maps the score to a level, staying at the level it is already on
+// while the score is inside that level's hysteresis band.
 func (r *root) levelFor() Level {
 	switch {
-	case r.heat >= busyEnter:
-		return Busy
-	case r.level == Busy && r.heat > busyExit:
-		return Busy
-	case r.heat >= warmEnter:
-		return Warm
+	case r.heat >= heavyEnter:
+		return Heavy
+	case r.level == Heavy && r.heat > heavyExit:
+		return Heavy
+	case r.heat >= mediumEnter:
+		return Medium
+	case r.level == Medium && r.heat > mediumExit:
+		return Medium
+	case r.heat >= lightEnter:
+		return Light
+	case r.level == Light && r.heat > lightExit:
+		return Light
 	default:
 		return Idle
 	}

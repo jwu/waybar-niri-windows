@@ -101,30 +101,49 @@ func feed(n int, ticks, io uint64) []Level {
 }
 
 func TestLevelsFollowLoad(t *testing.T) {
-	// One core of CPU is busy within the first sample: a build reports itself
-	// immediately.
-	if levels := feed(1, clkTck, 0); levels[0] != Busy {
-		t.Errorf("a full core for one sample is %v, want Busy", levels[0])
+	// A whole core is yellow and stays there: Heavy is reserved for more than a
+	// core, so a single-threaded task can never flicker into red.
+	if levels := feed(8, clkTck, 0); levels[7] != Medium {
+		t.Errorf("a whole core settled at %v, want Medium", levels[7])
 	}
 
-	// 15% of a core is the busy threshold, so it takes three samples to get
-	// there (the score approaches its input instead of jumping to it).
-	want := []Level{Warm, Warm, Busy, Busy}
-	if levels := feed(4, clkTck*15/100, 0); !slices.Equal(levels, want) {
-		t.Errorf("15%% of a core is %v, want %v", levels, want)
+	// Two cores get there in the second sample, eight in the first (the score
+	// is capped, so a big build does not push it far past the top tier).
+	want := []Level{Medium, Heavy}
+	if levels := feed(2, clkTck*2, 0); !slices.Equal(levels, want) {
+		t.Errorf("two cores is %v, want %v", levels, want)
+	}
+	if levels := feed(1, clkTck*8, 0); levels[0] != Heavy {
+		t.Errorf("eight cores is %v, want Heavy", levels[0])
 	}
 
-	// A quiet background load never reaches busy, which is what keeps a
-	// browser tab that repaints itself from lighting up as a build.
-	want = []Level{Idle, Idle, Warm, Warm, Warm}
-	if levels := feed(5, 2, 0); !slices.Equal(levels, want) {
-		t.Errorf("2%% of a core is %v, want %v", levels, want)
+	// 79% of a core is a terminal running something: Medium, never Heavy.
+	if levels := feed(8, clkTck*79/100, 0); levels[7] != Medium {
+		t.Errorf("79%% of a core settled at %v, want Medium", levels[7])
 	}
 
-	// Block traffic counts on its own: a download that touches the disk for
-	// 5 MB per sample is busy even with no CPU to speak of.
-	want = []Level{Warm, Warm, Busy}
-	if levels := feed(3, 0, busyIO); !slices.Equal(levels, want) {
+	// The boundary between "a little" and "a lot" sits at 20% of a core.
+	if levels := feed(3, clkTck*25/100, 0); levels[2] != Medium {
+		t.Errorf("25%% of a core is %v, want Medium", levels[2])
+	}
+	if levels := feed(8, clkTck*15/100, 0); levels[7] != Light {
+		t.Errorf("15%% of a core settled at %v, want Light", levels[7])
+	}
+
+	// Light starts at 3% of a core: a background tab at 4% shows up in the
+	// second sample, a tree at 1% never leaves Idle.
+	want = []Level{Idle, Light}
+	if levels := feed(2, clkTck*4/100, 0); !slices.Equal(levels, want) {
+		t.Errorf("4%% of a core is %v, want %v", levels, want)
+	}
+	if levels := feed(8, clkTck/100, 0); levels[7] != Idle {
+		t.Errorf("1%% of a core settled at %v, want Idle", levels[7])
+	}
+
+	// Block traffic counts on its own: 40 MiB/s is Heavy with no CPU to speak
+	// of, which is what a download being written to disk looks like.
+	want = []Level{Medium, Heavy}
+	if levels := feed(2, 0, 40<<20); !slices.Equal(levels, want) {
 		t.Errorf("a disk-bound tree is %v, want %v", levels, want)
 	}
 }
@@ -132,15 +151,15 @@ func TestLevelsFollowLoad(t *testing.T) {
 func TestLevelsDecayAfterWorkStops(t *testing.T) {
 	r := &root{}
 	for i := 0; i < 3; i++ {
-		r.advance(clkTck, 0, 1)
+		r.advance(clkTck*8, 0, 1) // eight cores, capped
 	}
-	if r.level != Busy {
-		t.Fatalf("working tree is %v, want Busy", r.level)
+	if r.level != Heavy {
+		t.Fatalf("a saturated tree is %v, want Heavy", r.level)
 	}
 
-	// The score is capped, so the levels spell out a fixed memory rather than
-	// one scaled by how hard the tree worked.
-	want := []Level{Busy, Warm, Warm, Warm, Warm, Idle, Idle}
+	// The fade spells out the memory of the score: Heavy for three samples,
+	// Medium for four, Light for three, then Idle.
+	want := []Level{Heavy, Heavy, Heavy, Medium, Medium, Medium, Medium, Light, Light, Light, Idle}
 	for i, expected := range want {
 		r.advance(0, 0, 1)
 		if r.level != expected {

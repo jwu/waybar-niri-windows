@@ -24,8 +24,8 @@ import (
 const activityInterval = time.Second
 
 // activityClasses are the classes a tile can carry, from least to most active.
-// Idle is the absence of both, so it is not in the list.
-var activityClasses = []procs.Level{procs.Warm, procs.Busy}
+// Idle is the absence of all of them, so it is not in the list.
+var activityClasses = []procs.Level{procs.Light, procs.Medium, procs.Heavy}
 
 // startActivity runs the sampler. It lives off the GTK thread, which may not
 // touch a widget, so every tick hands its result to the main loop instead.

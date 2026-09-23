@@ -34,8 +34,8 @@ func TestLevelsByWindowSpreadsAProcessOverItsWindows(t *testing.T) {
 	// of window 1. Window 4 is a process that exited while the sample was on
 	// its way, and window 5 has no pid at all: neither gets a level.
 	levels := map[int]procs.Level{
-		100: procs.Busy,
-		200: procs.Warm,
+		100: procs.Heavy,
+		200: procs.Light,
 	}
 	windows := []*niri.Window{
 		windowFixture(1, pidOf(100)),
@@ -46,9 +46,9 @@ func TestLevelsByWindowSpreadsAProcessOverItsWindows(t *testing.T) {
 	}
 
 	want := map[uint64]procs.Level{
-		1: procs.Busy,
-		2: procs.Busy,
-		3: procs.Warm,
+		1: procs.Heavy,
+		2: procs.Heavy,
+		3: procs.Light,
 	}
 	got := levelsByWindow(windows, levels)
 	if len(got) != len(want) {
