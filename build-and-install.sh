@@ -25,7 +25,12 @@ if [ -f "$out" ]; then
 	cp -a "$out" "$backup"
 	echo "backup:    $backup"
 fi
-install -m 644 waybar-niri-windows.so "$out"
+# Install by rename instead of overwriting $out in place: waybar keeps the old
+# file mapped, and replacing the bytes it is executing kills it within seconds
+# (SIGSEGV or SIGILL, plus a core dump). A rename swaps in a fresh inode and
+# keeps the old one alive for the running process.
+install -m 644 waybar-niri-windows.so "$out.new"
+mv -f "$out.new" "$out"
 echo "installed: $out"
 echo
 echo "waybar only loads cffi modules at startup, so restart it:"
