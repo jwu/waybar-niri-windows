@@ -141,49 +141,6 @@ type Workspace struct {
 	ActiveWindowId *uint64 `json:"active_window_id"`
 }
 
-// Logical geometry of an output, as reported by niri's Outputs request.
-//
-// Width/Height are the post-transform logical size, i.e. the coordinate space
-// windows live in. On a rotated output they differ from the mode's dimensions.
-type LogicalOutput struct {
-	X         int     `json:"x"`
-	Y         int     `json:"y"`
-	Width     int     `json:"width"`
-	Height    int     `json:"height"`
-	Scale     float64 `json:"scale"`
-	Transform string  `json:"transform"`
-}
-
-// A mode of an output.
-type OutputMode struct {
-	Width       int  `json:"width"`
-	Height      int  `json:"height"`
-	RefreshRate int  `json:"refresh_rate"`
-	IsPreferred bool `json:"is_preferred"`
-}
-
-// An output, as returned by the Outputs IPC request.
-type Output struct {
-	Name    string         `json:"name"`
-	Logical *LogicalOutput `json:"logical"`
-	// Modes of the output, and the index of the current one in Modes.
-	Modes       []OutputMode `json:"modes"`
-	CurrentMode *uint8       `json:"current_mode"`
-}
-
-// Size returns the output's logical size, falling back to the current mode when
-// the logical geometry is missing (e.g. no mode is set).
-func (o Output) Size() (width, height int) {
-	if o.Logical != nil && o.Logical.Width > 0 && o.Logical.Height > 0 {
-		return o.Logical.Width, o.Logical.Height
-	}
-	if o.CurrentMode != nil && int(*o.CurrentMode) < len(o.Modes) {
-		mode := o.Modes[*o.CurrentMode]
-		return mode.Width, mode.Height
-	}
-	return 0, 0
-}
-
 // Configured keyboard layouts.
 type KeyboardLayouts struct {
 	// XKB names of the configured layouts.
