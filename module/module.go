@@ -213,6 +213,8 @@ func (i *Instance) Update() {
 		return
 	}
 
+	log.Tracef("rebuilding %s window tiles", i.config.Mode)
+
 	if i.config.Mode == TextMode {
 		text := i.niriState.Text(i.monitor, i.config.Symbols)
 
