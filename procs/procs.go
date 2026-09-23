@@ -6,18 +6,15 @@
 // it opening /proc/<pid>/stat once per process, which is affordable at 1 Hz;
 // see docs/waybar.md for the measurements.
 //
-// Two counters feed one score:
+// The score is one counter: the CPU time of a whole tree (utime+stime), in
+// cores. Block IO was dropped deliberately: a window whose work is mostly disk
+// is rare next to one that computes, and it costs a second file per tree member
+// (/proc/<pid>/io) on top of the pass over every process. Reading rchar and
+// wchar instead would be cheaper and useless: they count syscall traffic, and an
+// idle terminal repainting a spinner makes plenty of that.
 //
-//   - CPU time (utime+stime) catches compute.
-//   - Block IO (read_bytes+write_bytes) catches work that is mostly waiting on
-//     the disk, which a build or a download does for long stretches.
-//
-// rchar/wchar are deliberately not used. They count syscall traffic, and pty
-// traffic is syscall traffic: an idle terminal that repaints a spinner moves
-// tens of KB/s, and waybar itself would be the busiest reader in the session.
-//
-// None of this measures "running a command". A tree that sleeps, or that waits
-// on the network, has no CPU and no block IO, so it reads as idle.
+// None of this measures "running a command". A tree that sleeps, waits on the
+// network, or leaves the work to the GPU has no CPU time and reads as idle.
 package procs
 
 import (
@@ -68,21 +65,13 @@ func (l Level) String() string {
 	}
 }
 
-// One unit of score: a whole core, or 20 MiB/s of block traffic. Each signal
-// is divided by its own unit, so the tiers below are the same numbers for
-// either of them.
-const (
-	unitCPU = 1.0      // cores per unit
-	unitIO  = 20 << 20 // bytes per second per unit
-)
-
-// The tier boundaries on that score, in units, plus the width of the window the
-// level is taken from.
+// The tier boundaries, in cores, plus the width of the window the level is taken
+// from.
 //
-//	grey   below 0.08   under 8% of a core, or 1.6 MiB/s on disk
+//	grey   below 0.08   under 8% of one core
 //	green  0.08 - 0.2   8% to 20% of a core
 //	yellow 0.2 - 1.5    20% of a core up to one and a half cores
-//	red    1.5 and up   more than one and a half cores, or 30 MiB/s
+//	red    1.5 and up   more than one and a half cores
 //
 // The bottom boundary is where "nothing you would notice" ends, and it comes
 // from a measurement rather than a guess: an idle Chrome with a page running
@@ -122,7 +111,6 @@ func levelFor(score float64) Level {
 type proc struct {
 	ppid  int
 	ticks uint64 // utime+stime
-	io    uint64 // read_bytes+write_bytes
 }
 
 // root is the activity of one process tree, keyed by the pid it was sampled
@@ -163,7 +151,7 @@ func (t *Tracker) Update(roots []int) map[int]Level {
 	}
 	t.last = now
 
-	cur, children := scan(roots)
+	cur, children := scan()
 
 	levels := make(map[int]Level, len(roots))
 	next := make(map[int]*root, len(roots))
@@ -180,8 +168,8 @@ func (t *Tracker) Update(roots []int) map[int]Level {
 			continue
 		}
 
-		ticks, io := treeDelta(cur, t.prev, children, pid)
-		r.advance(ticks, io, dt)
+		ticks := treeDelta(cur, t.prev, children, pid)
+		r.advance(ticks, dt)
 		levels[pid] = r.level
 	}
 
@@ -193,14 +181,12 @@ func (t *Tracker) Update(roots []int) map[int]Level {
 // advance folds one sample into the window. dt is the wall time since the
 // previous sample, measured rather than assumed so that a late sample cannot
 // inflate the rate.
-func (r *root) advance(ticks, io uint64, dt float64) {
+func (r *root) advance(ticks uint64, dt float64) {
 	if dt <= 0 {
 		return
 	}
 
-	cpu := float64(ticks) / clkTck / dt // cores
-	rate := float64(io) / dt            // bytes per second
-	instant := max(cpu/unitCPU, rate/unitIO)
+	instant := float64(ticks) / clkTck / dt // cores
 
 	r.samples[r.next] = instant
 	r.next = (r.next + 1) % window
@@ -223,28 +209,11 @@ func median(samples []float64) float64 {
 	return sorted[len(sorted)/2]
 }
 
-// scan reads one sample of /proc: the parent and the CPU ticks of every
-// process, plus the block IO of the processes in the given trees.
-//
-// IO is read only for those trees because /proc/<pid>/io is the expensive file
-// and most processes are in no tree at all. The returned index maps a pid to
-// its children.
-func scan(roots []int) (map[int]proc, map[int][]int) {
+// scan reads one sample of /proc: the parent and the CPU ticks of every process.
+// The returned index maps a pid to its children.
+func scan() (map[int]proc, map[int][]int) {
 	procs := statScan()
-	children := index(procs)
-
-	for _, pid := range roots {
-		for _, member := range tree(children, pid) {
-			p, ok := procs[member]
-			if !ok {
-				continue
-			}
-			p.io = readIO(member)
-			procs[member] = p
-		}
-	}
-
-	return procs, children
+	return procs, index(procs)
 }
 
 func statScan() map[int]proc {
@@ -306,33 +275,6 @@ func readStat(pid int) (proc, bool) {
 	return proc{ppid: ppid, ticks: utime + stime}, true
 }
 
-// readIO returns the block traffic of one process. Accounts of what a process
-// read and wrote are only available to processes that may ptrace it, so a
-// process owned by another user reports zero instead of failing the sample.
-func readIO(pid int) uint64 {
-	b, err := os.ReadFile(fmt.Sprintf("%s/%d/io", procRoot, pid))
-	if err != nil {
-		return 0
-	}
-
-	var total uint64
-	for _, line := range strings.Split(string(b), "\n") {
-		value, ok := strings.CutPrefix(line, "read_bytes:")
-		if !ok {
-			value, ok = strings.CutPrefix(line, "write_bytes:")
-		}
-		if !ok {
-			continue
-		}
-		n, err := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
-		if err != nil {
-			continue
-		}
-		total += n
-	}
-	return total
-}
-
 // index maps every process to its children.
 func index(procs map[int]proc) map[int][]int {
 	children := make(map[int][]int)
@@ -360,10 +302,10 @@ func tree(children map[int][]int, root int) []int {
 	return members
 }
 
-// treeDelta sums the ticks and the block IO of a whole tree between two
-// samples. Processes that are missing from the older sample are skipped, not
-// counted in full: their counters are totals for their whole lifetime.
-func treeDelta(cur, prev map[int]proc, children map[int][]int, root int) (ticks, io uint64) {
+// treeDelta sums the CPU ticks of a whole tree between two samples. Processes
+// that are missing from the older sample are skipped, not counted in full: their
+// counters are totals for their whole lifetime.
+func treeDelta(cur, prev map[int]proc, children map[int][]int, root int) (ticks uint64) {
 	for _, pid := range tree(children, root) {
 		c, ok := cur[pid]
 		if !ok {
@@ -374,9 +316,8 @@ func treeDelta(cur, prev map[int]proc, children map[int][]int, root int) (ticks,
 			continue
 		}
 		ticks += counterDelta(p.ticks, c.ticks)
-		io += counterDelta(p.io, c.io)
 	}
-	return ticks, io
+	return ticks
 }
 
 // counterDelta returns the increase of a monotonic counter. A counter that went

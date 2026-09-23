@@ -12,35 +12,27 @@ func TestTreeDeltaSumsAWholeTree(t *testing.T) {
 	//      └─── 400
 	// 900 is an unrelated process: it is in the sample, but in no tree.
 	cur := map[int]proc{
-		100: {ppid: 0, ticks: 30, io: 3000},
-		200: {ppid: 100, ticks: 20, io: 2000},
-		300: {ppid: 200, ticks: 10, io: 1000},
-		400: {ppid: 100, ticks: 5, io: 500},
-		900: {ppid: 1, ticks: 999, io: 999999},
+		100: {ppid: 0, ticks: 30},
+		200: {ppid: 100, ticks: 20},
+		300: {ppid: 200, ticks: 10},
+		400: {ppid: 100, ticks: 5},
+		900: {ppid: 1, ticks: 999},
 	}
 	prev := map[int]proc{
-		100: {ticks: 20, io: 2000},
-		200: {ticks: 15, io: 1500},
-		300: {ticks: 6, io: 400},
-		400: {ticks: 0, io: 0},
-		900: {ticks: 0, io: 0},
+		100: {ticks: 20},
+		200: {ticks: 15},
+		300: {ticks: 6},
+		400: {ticks: 0},
+		900: {ticks: 0},
 	}
 
-	ticks, io := treeDelta(cur, prev, index(cur), 100)
-	if want := uint64(24); ticks != want {
-		t.Errorf("ticks = %d, want %d", ticks, want)
-	}
-	if want := uint64(2600); io != want {
-		t.Errorf("io = %d, want %d", io, want)
+	if got, want := treeDelta(cur, prev, index(cur), 100), uint64(24); got != want {
+		t.Errorf("treeDelta = %d, want %d", got, want)
 	}
 
 	// The middle of the tree is measured on its own, not as a share of root.
-	ticks, io = treeDelta(cur, prev, index(cur), 200)
-	if want := uint64(9); ticks != want {
-		t.Errorf("subtree ticks = %d, want %d", ticks, want)
-	}
-	if want := uint64(1100); io != want {
-		t.Errorf("subtree io = %d, want %d", io, want)
+	if got, want := treeDelta(cur, prev, index(cur), 200), uint64(9); got != want {
+		t.Errorf("subtree treeDelta = %d, want %d", got, want)
 	}
 }
 
@@ -48,19 +40,15 @@ func TestTreeDeltaSkipsProcessesWithoutABaseline(t *testing.T) {
 	// 300 was spawned since the previous sample: its counters are totals for
 	// its whole lifetime, so counting them would fake a burst of work.
 	cur := map[int]proc{
-		100: {ppid: 0, ticks: 20, io: 2000},
-		300: {ppid: 100, ticks: 900, io: 90000},
+		100: {ppid: 0, ticks: 20},
+		300: {ppid: 100, ticks: 900},
 	}
 	prev := map[int]proc{
-		100: {ticks: 10, io: 1000},
+		100: {ticks: 10},
 	}
 
-	ticks, io := treeDelta(cur, prev, index(cur), 100)
-	if want := uint64(10); ticks != want {
-		t.Errorf("ticks = %d, want %d (the new process must not count)", ticks, want)
-	}
-	if want := uint64(1000); io != want {
-		t.Errorf("io = %d, want %d (the new process must not count)", io, want)
+	if got, want := treeDelta(cur, prev, index(cur), 100), uint64(10); got != want {
+		t.Errorf("treeDelta = %d, want %d (the new process must not count)", got, want)
 	}
 }
 
@@ -90,11 +78,11 @@ func TestTreeVisitsEveryMemberOnce(t *testing.T) {
 }
 
 // feed runs n samples of the given per-sample counters through a fresh tree.
-func feed(n int, ticks, io uint64) []Level {
+func feed(n int, ticks uint64) []Level {
 	r := &root{}
 	levels := make([]Level, 0, n)
 	for i := 0; i < n; i++ {
-		r.advance(ticks, io, 1)
+		r.advance(ticks, 1)
 		levels = append(levels, r.level)
 	}
 	return levels
@@ -105,42 +93,39 @@ func TestLevelsFollowLoad(t *testing.T) {
 	// level is the median of the last five samples, and a window starts out as
 	// zeroes.
 	want := []Level{Idle, Idle, Medium, Medium}
-	if levels := feed(4, clkTck, 0); !slices.Equal(levels, want) {
+	if levels := feed(4, clkTck); !slices.Equal(levels, want) {
 		t.Errorf("a whole core is %v, want %v", levels, want)
 	}
 
 	// Over the heavy threshold there is nothing to filter, so it is taken as it
-	// comes: two cores, eight cores, or a disk doing 40 MiB/s are all red from
-	// the first sample.
+	// comes: two cores and eight cores are both red from the first sample.
 	for _, tc := range []struct {
 		name  string
 		ticks uint64
-		io    uint64
 	}{
-		{"two cores", clkTck * 2, 0},
-		{"eight cores", clkTck * 8, 0},
-		{"40 MiB/s", 0, 40 << 20},
+		{"two cores", clkTck * 2},
+		{"eight cores", clkTck * 8},
 	} {
-		if levels := feed(1, tc.ticks, tc.io); levels[0] != Heavy {
+		if levels := feed(1, tc.ticks); levels[0] != Heavy {
 			t.Errorf("%s is %v, want Heavy", tc.name, levels[0])
 		}
 	}
 
 	// 79% of a core is a terminal running something: Medium, never Heavy,
 	// because a boundary on exactly one core would flicker.
-	if levels := feed(8, clkTck*79/100, 0); levels[7] != Medium {
+	if levels := feed(8, clkTck*79/100); levels[7] != Medium {
 		t.Errorf("79%% of a core settled at %v, want Medium", levels[7])
 	}
 
 	// The boundaries: 25% is Medium, 15% is Light, and what an idle browser
 	// does (1% to 4%) is nothing at all.
-	if levels := feed(6, clkTck*25/100, 0); levels[5] != Medium {
+	if levels := feed(6, clkTck*25/100); levels[5] != Medium {
 		t.Errorf("25%% of a core settled at %v, want Medium", levels[5])
 	}
-	if levels := feed(6, clkTck*15/100, 0); levels[5] != Light {
+	if levels := feed(6, clkTck*15/100); levels[5] != Light {
 		t.Errorf("15%% of a core settled at %v, want Light", levels[5])
 	}
-	if levels := feed(30, clkTck*4/100, 0); levels[29] != Idle {
+	if levels := feed(30, clkTck*4/100); levels[29] != Idle {
 		t.Errorf("4%% of a core settled at %v, want Idle", levels[29])
 	}
 }
@@ -151,7 +136,7 @@ func TestBurstsDoNotLightATile(t *testing.T) {
 	// tile.
 	r := &root{}
 	for _, burst := range []float64{0.03, 0.04, 0.32, 0.03, 0.02, 0.05, 0.31, 0.03} {
-		r.advance(uint64(burst*clkTck), 0, 1)
+		r.advance(uint64(burst*clkTck), 1)
 		if r.level != Idle {
 			t.Fatalf("a burst of %.0f%% in an idle tree lit the tile as %v", burst*100, r.level)
 		}
@@ -160,7 +145,7 @@ func TestBurstsDoNotLightATile(t *testing.T) {
 	// Three of the last five samples is what it takes for work that keeps
 	// going: 12% of a core is Light.
 	for i := 0; i < 3; i++ {
-		r.advance(clkTck*12/100, 0, 1)
+		r.advance(clkTck*12/100, 1)
 	}
 	if r.level != Light {
 		t.Errorf("12%% of a core kept up is %v, want Light", r.level)
@@ -168,7 +153,7 @@ func TestBurstsDoNotLightATile(t *testing.T) {
 
 	// And where it lands is the load itself, not the noise that came before.
 	for i := 0; i < 3; i++ {
-		r.advance(clkTck*30/100, 0, 1)
+		r.advance(clkTck*30/100, 1)
 	}
 	if r.level != Medium {
 		t.Errorf("30%% of a core kept up is %v, want Medium", r.level)
@@ -178,7 +163,7 @@ func TestBurstsDoNotLightATile(t *testing.T) {
 func TestLevelsDropWhenWorkStops(t *testing.T) {
 	r := &root{}
 	for i := 0; i < window; i++ {
-		r.advance(clkTck*8, 0, 1)
+		r.advance(clkTck*8, 1)
 	}
 	if r.level != Heavy {
 		t.Fatalf("a saturated tree is %v, want Heavy", r.level)
@@ -189,7 +174,7 @@ func TestLevelsDropWhenWorkStops(t *testing.T) {
 	// yellow in between.
 	want := []Level{Heavy, Heavy, Idle}
 	for i, expected := range want {
-		r.advance(0, 0, 1)
+		r.advance(0, 1)
 		if r.level != expected {
 			t.Fatalf("sample %d after work stopped is %v, want %v", i+1, r.level, expected)
 		}
@@ -198,7 +183,7 @@ func TestLevelsDropWhenWorkStops(t *testing.T) {
 
 func TestAdvanceIgnoresNonPositiveInterval(t *testing.T) {
 	r := &root{}
-	r.advance(clkTck, 0, 0)
+	r.advance(clkTck, 0)
 	if r.level != Idle || r.samples[0] != 0 {
 		t.Errorf("a zero interval scored %v/%v, want Idle/0", r.level, r.samples[0])
 	}
@@ -239,7 +224,7 @@ func TestScanSeesChildren(t *testing.T) {
 	defer child.Wait()
 	defer child.Process.Kill()
 
-	procs, children := scan([]int{os.Getpid()})
+	procs, children := scan()
 
 	p, ok := procs[child.Process.Pid]
 	if !ok {
