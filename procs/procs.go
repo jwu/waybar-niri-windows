@@ -6,7 +6,7 @@
 // it opening /proc/<pid>/stat once per process, which is affordable at 1 Hz;
 // see docs/waybar.md for the measurements.
 //
-// Two counters feed one decaying score:
+// Two counters feed one score:
 //
 //   - CPU time (utime+stime) catches compute.
 //   - Block IO (read_bytes+write_bytes) catches work that is mostly waiting on
@@ -23,6 +23,7 @@ package procs
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -75,36 +76,47 @@ const (
 	unitIO  = 20 << 20 // bytes per second per unit
 )
 
-// The tier boundaries on that score, in units, plus the hysteresis that keeps a
-// tree sitting on a boundary from flapping between two classes: every change
-// costs a repaint, and a bar that flickers is worse than one that is a second
-// late. Each exit sits more than one decay step below its enter, so a single
-// quiet sample cannot drop the level.
+// The tier boundaries on that score, in units, plus the width of the window the
+// level is taken from.
 //
-//	grey   0.03 and below  under 3% of a core, or 0.6 MiB/s on disk
-//	green  0.03 - 0.2      3% to 20% of a core
-//	yellow 0.2 - 1.5       20% of a core up to one and a half cores
-//	red    1.5 and up      more than one and a half cores, or 30 MiB/s
+//	grey   below 0.08   under 8% of a core, or 1.6 MiB/s on disk
+//	green  0.08 - 0.2   8% to 20% of a core
+//	yellow 0.2 - 1.5    20% of a core up to one and a half cores
+//	red    1.5 and up   more than one and a half cores, or 30 MiB/s
 //
-// The boundaries are deliberately at fractional loads that real work does not
-// sit on: a single-threaded task is one whole core, which is comfortably
-// yellow, and it would flicker if the boundary sat at exactly one. A tree that
-// does sit exactly on a boundary stays in the lower tier, because a score that
-// approaches its input never quite reaches it.
+// The bottom boundary is where "nothing you would notice" ends, and it comes
+// from a measurement rather than a guess: an idle Chrome with a page running
+// timer work sits between 1% and 6% of a core (median 3%) and bursts to 30%.
+//
+// The upper two sit on fractions of a core on purpose: real work parks on whole
+// cores (a single-threaded task is 1.0), and a boundary there flickers.
 const (
-	lightEnter, lightExit   = 0.03, 0.02
-	mediumEnter, mediumExit = 0.2, 0.1
-	heavyEnter, heavyExit   = 1.5, 0.8
+	lightEnter  = 0.08
+	mediumEnter = 0.2
+	heavyEnter  = 1.5
 
-	// heatRise is how much of a sample the score takes on while the load
-	// rises, heatFall how much of it survives a sample while the load falls.
-	// A sustained load is picked up within two or three samples and fades over
-	// about ten, and because the fall is a plain decay the memory does not grow
-	// with the size of the burst.
-	heatRise = 0.7
-	heatFall = 0.6
-	heatMax  = 4.0
+	// window is how many samples the level is taken over, one per second. The
+	// level is the median of the window rather than the newest sample, which is
+	// what keeps a browser's idle polling grey while work that keeps going still
+	// shows up: one-second bursts cannot move the median of five, and three
+	// samples of the same load can. A window starts out as zeroes, so a load
+	// that was already running when the bar started takes three samples to show.
+	window = 5
 )
+
+// levelFor maps a score to a tier.
+func levelFor(score float64) Level {
+	switch {
+	case score >= heavyEnter:
+		return Heavy
+	case score >= mediumEnter:
+		return Medium
+	case score >= lightEnter:
+		return Light
+	default:
+		return Idle
+	}
+}
 
 // proc is the part of one process that this package reads.
 type proc struct {
@@ -113,11 +125,12 @@ type proc struct {
 	io    uint64 // read_bytes+write_bytes
 }
 
-// root is the decaying score of one process tree, keyed by the pid it was
-// sampled from.
+// root is the activity of one process tree, keyed by the pid it was sampled
+// from.
 type root struct {
-	heat  float64
-	level Level
+	samples [window]float64
+	next    int
+	level   Level
 }
 
 // Tracker keeps the previous sample so that it can report deltas, plus one
@@ -177,7 +190,7 @@ func (t *Tracker) Update(roots []int) map[int]Level {
 	return levels
 }
 
-// advance folds one sample into the score. dt is the wall time since the
+// advance folds one sample into the window. dt is the wall time since the
 // previous sample, measured rather than assumed so that a late sample cannot
 // inflate the rate.
 func (r *root) advance(ticks, io uint64, dt float64) {
@@ -189,34 +202,25 @@ func (r *root) advance(ticks, io uint64, dt float64) {
 	rate := float64(io) / dt            // bytes per second
 	instant := max(cpu/unitCPU, rate/unitIO)
 
-	if instant > r.heat {
-		r.heat = r.heat*(1-heatRise) + instant*heatRise
-	} else {
-		r.heat *= heatFall
+	r.samples[r.next] = instant
+	r.next = (r.next + 1) % window
+
+	// A tree over the heavy threshold is Heavy on the spot: a build eating
+	// several cores should be red now, not three samples from now, and work that
+	// large does not need to be filtered.
+	if instant >= heavyEnter {
+		r.level = Heavy
+		return
 	}
-	r.heat = min(r.heat, heatMax)
-	r.level = r.levelFor()
+	r.level = levelFor(median(r.samples[:]))
 }
 
-// levelFor maps the score to a level, staying at the level it is already on
-// while the score is inside that level's hysteresis band.
-func (r *root) levelFor() Level {
-	switch {
-	case r.heat >= heavyEnter:
-		return Heavy
-	case r.level == Heavy && r.heat > heavyExit:
-		return Heavy
-	case r.heat >= mediumEnter:
-		return Medium
-	case r.level == Medium && r.heat > mediumExit:
-		return Medium
-	case r.heat >= lightEnter:
-		return Light
-	case r.level == Light && r.heat > lightExit:
-		return Light
-	default:
-		return Idle
-	}
+// median returns the middle value of a sample window, which is always full
+// because it starts out as zeroes.
+func median(samples []float64) float64 {
+	sorted := append([]float64(nil), samples...)
+	slices.Sort(sorted)
+	return sorted[len(sorted)/2]
 }
 
 // scan reads one sample of /proc: the parent and the CPU ticks of every

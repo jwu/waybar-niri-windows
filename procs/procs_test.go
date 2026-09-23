@@ -89,7 +89,7 @@ func TestTreeVisitsEveryMemberOnce(t *testing.T) {
 	}
 }
 
-// feed runs n samples of the given per-sample counters through a fresh score.
+// feed runs n samples of the given per-sample counters through a fresh tree.
 func feed(n int, ticks, io uint64) []Level {
 	r := &root{}
 	levels := make([]Level, 0, n)
@@ -101,65 +101,93 @@ func feed(n int, ticks, io uint64) []Level {
 }
 
 func TestLevelsFollowLoad(t *testing.T) {
-	// A whole core is yellow and stays there: Heavy is reserved for more than a
-	// core, so a single-threaded task can never flicker into red.
-	if levels := feed(8, clkTck, 0); levels[7] != Medium {
-		t.Errorf("a whole core settled at %v, want Medium", levels[7])
+	// A whole core is Medium, and it takes three samples to get there: the
+	// level is the median of the last five samples, and a window starts out as
+	// zeroes.
+	want := []Level{Idle, Idle, Medium, Medium}
+	if levels := feed(4, clkTck, 0); !slices.Equal(levels, want) {
+		t.Errorf("a whole core is %v, want %v", levels, want)
 	}
 
-	// Two cores get there in the second sample, eight in the first (the score
-	// is capped, so a big build does not push it far past the top tier).
-	want := []Level{Medium, Heavy}
-	if levels := feed(2, clkTck*2, 0); !slices.Equal(levels, want) {
-		t.Errorf("two cores is %v, want %v", levels, want)
-	}
-	if levels := feed(1, clkTck*8, 0); levels[0] != Heavy {
-		t.Errorf("eight cores is %v, want Heavy", levels[0])
+	// Over the heavy threshold there is nothing to filter, so it is taken as it
+	// comes: two cores, eight cores, or a disk doing 40 MiB/s are all red from
+	// the first sample.
+	for _, tc := range []struct {
+		name  string
+		ticks uint64
+		io    uint64
+	}{
+		{"two cores", clkTck * 2, 0},
+		{"eight cores", clkTck * 8, 0},
+		{"40 MiB/s", 0, 40 << 20},
+	} {
+		if levels := feed(1, tc.ticks, tc.io); levels[0] != Heavy {
+			t.Errorf("%s is %v, want Heavy", tc.name, levels[0])
+		}
 	}
 
-	// 79% of a core is a terminal running something: Medium, never Heavy.
+	// 79% of a core is a terminal running something: Medium, never Heavy,
+	// because a boundary on exactly one core would flicker.
 	if levels := feed(8, clkTck*79/100, 0); levels[7] != Medium {
 		t.Errorf("79%% of a core settled at %v, want Medium", levels[7])
 	}
 
-	// The boundary between "a little" and "a lot" sits at 20% of a core.
-	if levels := feed(3, clkTck*25/100, 0); levels[2] != Medium {
-		t.Errorf("25%% of a core is %v, want Medium", levels[2])
+	// The boundaries: 25% is Medium, 15% is Light, and what an idle browser
+	// does (1% to 4%) is nothing at all.
+	if levels := feed(6, clkTck*25/100, 0); levels[5] != Medium {
+		t.Errorf("25%% of a core settled at %v, want Medium", levels[5])
 	}
-	if levels := feed(8, clkTck*15/100, 0); levels[7] != Light {
-		t.Errorf("15%% of a core settled at %v, want Light", levels[7])
+	if levels := feed(6, clkTck*15/100, 0); levels[5] != Light {
+		t.Errorf("15%% of a core settled at %v, want Light", levels[5])
 	}
-
-	// Light starts at 3% of a core: a background tab at 4% shows up in the
-	// second sample, a tree at 1% never leaves Idle.
-	want = []Level{Idle, Light}
-	if levels := feed(2, clkTck*4/100, 0); !slices.Equal(levels, want) {
-		t.Errorf("4%% of a core is %v, want %v", levels, want)
-	}
-	if levels := feed(8, clkTck/100, 0); levels[7] != Idle {
-		t.Errorf("1%% of a core settled at %v, want Idle", levels[7])
-	}
-
-	// Block traffic counts on its own: 40 MiB/s is Heavy with no CPU to speak
-	// of, which is what a download being written to disk looks like.
-	want = []Level{Medium, Heavy}
-	if levels := feed(2, 0, 40<<20); !slices.Equal(levels, want) {
-		t.Errorf("a disk-bound tree is %v, want %v", levels, want)
+	if levels := feed(30, clkTck*4/100, 0); levels[29] != Idle {
+		t.Errorf("4%% of a core settled at %v, want Idle", levels[29])
 	}
 }
 
-func TestLevelsDecayAfterWorkStops(t *testing.T) {
+func TestBurstsDoNotLightATile(t *testing.T) {
+	// An idle browser: a few percent of a core with one-second bursts to a
+	// third of one, which is what a mean over the samples turned into a green
+	// tile.
 	r := &root{}
+	for _, burst := range []float64{0.03, 0.04, 0.32, 0.03, 0.02, 0.05, 0.31, 0.03} {
+		r.advance(uint64(burst*clkTck), 0, 1)
+		if r.level != Idle {
+			t.Fatalf("a burst of %.0f%% in an idle tree lit the tile as %v", burst*100, r.level)
+		}
+	}
+
+	// Three of the last five samples is what it takes for work that keeps
+	// going: 12% of a core is Light.
 	for i := 0; i < 3; i++ {
-		r.advance(clkTck*8, 0, 1) // eight cores, capped
+		r.advance(clkTck*12/100, 0, 1)
+	}
+	if r.level != Light {
+		t.Errorf("12%% of a core kept up is %v, want Light", r.level)
+	}
+
+	// And where it lands is the load itself, not the noise that came before.
+	for i := 0; i < 3; i++ {
+		r.advance(clkTck*30/100, 0, 1)
+	}
+	if r.level != Medium {
+		t.Errorf("30%% of a core kept up is %v, want Medium", r.level)
+	}
+}
+
+func TestLevelsDropWhenWorkStops(t *testing.T) {
+	r := &root{}
+	for i := 0; i < window; i++ {
+		r.advance(clkTck*8, 0, 1)
 	}
 	if r.level != Heavy {
 		t.Fatalf("a saturated tree is %v, want Heavy", r.level)
 	}
 
-	// The fade spells out the memory of the score: Heavy for three samples,
-	// Medium for four, Light for three, then Idle.
-	want := []Level{Heavy, Heavy, Heavy, Medium, Medium, Medium, Medium, Light, Light, Light, Idle}
+	// The level follows the window, so three quiet samples out of five are what
+	// it takes to fall: two samples of red, then straight to grey, with no
+	// yellow in between.
+	want := []Level{Heavy, Heavy, Idle}
 	for i, expected := range want {
 		r.advance(0, 0, 1)
 		if r.level != expected {
@@ -171,8 +199,8 @@ func TestLevelsDecayAfterWorkStops(t *testing.T) {
 func TestAdvanceIgnoresNonPositiveInterval(t *testing.T) {
 	r := &root{}
 	r.advance(clkTck, 0, 0)
-	if r.level != Idle || r.heat != 0 {
-		t.Errorf("a zero interval scored %v/%v, want Idle/0", r.level, r.heat)
+	if r.level != Idle || r.samples[0] != 0 {
+		t.Errorf("a zero interval scored %v/%v, want Idle/0", r.level, r.samples[0])
 	}
 }
 
