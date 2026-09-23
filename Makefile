@@ -1,4 +1,4 @@
-sources := $(wildcard lib/*.go) $(wildcard lib/*.c) $(wildcard lib/*.h) $(wildcard log/*.go) $(wildcard main/*.go) $(wildcard niri/*.go) $(wildcard module/*.go)
+sources := $(wildcard lib/*.go) $(wildcard lib/*.c) $(wildcard lib/*.h) $(wildcard log/*.go) $(wildcard main/*.go) $(wildcard niri/*.go) $(wildcard module/*.go) $(wildcard procs/*.go)
 
 waybar-niri-windows.so: $(sources)
 	go build -buildmode=c-shared -o $@ ./main

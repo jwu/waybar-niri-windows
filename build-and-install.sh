@@ -15,8 +15,8 @@ dest="${WAYBAR_DIR:-$HOME/.config/waybar}"
 out="$dest/waybar-niri-windows.so"
 
 cd "$src_dir"
-go test ./niri/
-go vet ./niri/
+go test ./...
+go vet ./niri/ ./module/ ./procs/
 go build -trimpath -ldflags="-s -w" -buildmode=c-shared -o waybar-niri-windows.so ./main
 
 mkdir -p "$dest"
@@ -25,10 +25,11 @@ if [ -f "$out" ]; then
 	cp -a "$out" "$backup"
 	echo "backup:    $backup"
 fi
-# Install by rename instead of overwriting $out in place: waybar keeps the old
-# file mapped, and replacing the bytes it is executing kills it within seconds
-# (SIGSEGV or SIGILL, plus a core dump). A rename swaps in a fresh inode and
-# keeps the old one alive for the running process.
+# Install by rename, never by overwriting $out in place: waybar has the module
+# mapped, and replacing the bytes it is executing kills it within seconds
+# (SIGSEGV or SIGILL, with a core dump). Renaming a fresh inode in keeps the old
+# one alive for the running process, so the swap is safe even though a restart
+# is still needed to load the new code.
 install -m 644 waybar-niri-windows.so "$out.new"
 mv -f "$out.new" "$out"
 echo "installed: $out"

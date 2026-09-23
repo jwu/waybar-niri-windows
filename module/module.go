@@ -12,6 +12,7 @@ import (
 	"wnw/jsonc"
 	"wnw/log"
 	"wnw/niri"
+	"wnw/procs"
 
 	"github.com/gotk3/gotk3/gdk"
 	"github.com/gotk3/gotk3/glib"
@@ -43,6 +44,13 @@ type Instance struct {
 	screenWidth     int
 	allocatedHeight int
 	config          Config
+
+	// Activity of the windows the tiles belong to, keyed by window id, and the
+	// sampler that fills it in. See activity.go.
+	tracker      *procs.Tracker
+	levels       map[uint64]procs.Level
+	activityDone chan struct{}
+	activityWg   sync.WaitGroup
 }
 
 func (i *Instance) Id() uintptr {
@@ -63,6 +71,7 @@ func New(niriState *niri.State, niriSocket niri.Socket, queueUpdate func()) *Ins
 		queueUpdate: queueUpdate,
 		niriState:   niriState,
 		niriSocket:  niriSocket,
+		tracker:     procs.NewTracker(),
 		config: Config{
 			Mode:              GraphicalMode,
 			ShowFloating:      ShowFloatingAuto,
@@ -185,6 +194,7 @@ func (i *Instance) Init(monitor string, screenWidth, screenHeight int) {
 
 	i.Notify()
 	i.niriState.OnUpdate(uint64(i.id), func(state *niri.State) { i.Notify() })
+	i.startActivity()
 }
 
 func (i *Instance) Deinit() {
@@ -192,6 +202,9 @@ func (i *Instance) Deinit() {
 	// while state callbacks take i.mu, so holding i.mu here inverts the lock
 	// order taken by Notify and can deadlock.
 	i.niriState.RemoveOnUpdate(uint64(i.id))
+
+	// Same reason: the sampler takes i.mu on every tick.
+	i.stopActivity()
 
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -299,6 +312,9 @@ func (i *Instance) Update() {
 
 				windowBox, _ := gtk.EventBoxNew()
 				windowBox.SetSizeRequest(width, height)
+				// Naming a tile after its window is what lets the activity walk map
+				// a widget back to a process without holding a reference to it.
+				windowBox.SetName(strconv.FormatUint(window.Id, 10))
 
 				style, _ := windowBox.GetStyleContext()
 				style.AddClass("tile")
@@ -334,6 +350,9 @@ func (i *Instance) Update() {
 	}
 
 	i.box.ShowAll()
+
+	// Show the levels sampled while the tiles were being built.
+	i.applyActivityLocked()
 }
 
 func (i *Instance) shouldShowFloating(floating []*niri.Window) bool {

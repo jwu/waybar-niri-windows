@@ -1,0 +1,331 @@
+// Package procs turns /proc into a per-window "is it working" signal.
+//
+// niri says nothing about what a window is doing, but it does report the pid of
+// the process behind it, and that pid is enough to measure the process tree by
+// hand. One pass over /proc costs about 5 ms for 400 processes, nearly all of
+// it opening /proc/<pid>/stat once per process, which is affordable at 1 Hz;
+// see docs/waybar.md for the measurements.
+//
+// The score is one counter: the CPU time of a whole tree (utime+stime), in
+// cores. Block IO was dropped deliberately: a window whose work is mostly disk
+// is rare next to one that computes, and it costs a second file per tree member
+// (/proc/<pid>/io) on top of the pass over every process. Reading rchar and
+// wchar instead would be cheaper and useless: they count syscall traffic, and an
+// idle terminal repainting a spinner makes plenty of that.
+//
+// None of this measures "running a command". A tree that sleeps, waits on the
+// network, or leaves the work to the GPU has no CPU time and reads as idle.
+package procs
+
+import (
+	"fmt"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+	"wnw/log"
+)
+
+const procRoot = "/proc"
+
+// clkTck is the kernel's USER_HZ: /proc/<pid>/stat reports CPU time in these
+// ticks, and 100 holds on every architecture Go runs on except alpha. The
+// standard library has no way to ask the kernel for it.
+const clkTck = 100
+
+// Level is how hard a process tree is working, now or a moment ago.
+type Level uint8
+
+const (
+	// Idle means the tree has not worked for the whole memory of the score,
+	// about ten seconds at the default tick.
+	Idle Level = iota
+	// Light means it is doing something small, or did a moment ago.
+	Light
+	// Medium means it is working, but not saturating a core.
+	Medium
+	// Heavy means it is using more than a whole core, or a comparable amount
+	// of disk.
+	Heavy
+)
+
+// String names the level. The module uses it as the CSS class of a tile;
+// Idle is the absence of class, so it has no rule of its own.
+func (l Level) String() string {
+	switch l {
+	case Heavy:
+		return "heavy"
+	case Medium:
+		return "medium"
+	case Light:
+		return "light"
+	default:
+		return "idle"
+	}
+}
+
+// The tier boundaries, in cores, plus the width of the window the level is taken
+// from.
+//
+//	grey   below 0.08   under 8% of one core
+//	green  0.08 - 0.2   8% to 20% of a core
+//	yellow 0.2 - 1.5    20% of a core up to one and a half cores
+//	red    1.5 and up   more than one and a half cores
+//
+// The bottom boundary is where "nothing you would notice" ends, and it comes
+// from a measurement rather than a guess: an idle Chrome with a page running
+// timer work sits between 1% and 6% of a core (median 3%) and bursts to 30%.
+//
+// The upper two sit on fractions of a core on purpose: real work parks on whole
+// cores (a single-threaded task is 1.0), and a boundary there flickers.
+const (
+	lightEnter  = 0.08
+	mediumEnter = 0.2
+	heavyEnter  = 1.5
+
+	// window is how many samples the level is taken over, one per second. The
+	// level is the median of the window rather than the newest sample, which is
+	// what keeps a browser's idle polling grey while work that keeps going still
+	// shows up: one-second bursts cannot move the median of five, and three
+	// samples of the same load can. A window starts out as zeroes, so a load
+	// that was already running when the bar started takes three samples to show.
+	window = 5
+)
+
+// levelFor maps a score to a tier.
+func levelFor(score float64) Level {
+	switch {
+	case score >= heavyEnter:
+		return Heavy
+	case score >= mediumEnter:
+		return Medium
+	case score >= lightEnter:
+		return Light
+	default:
+		return Idle
+	}
+}
+
+// proc is the part of one process that this package reads.
+type proc struct {
+	ppid  int
+	ticks uint64 // utime+stime
+}
+
+// root is the activity of one process tree, keyed by the pid it was sampled
+// from.
+type root struct {
+	samples [window]float64
+	next    int
+	level   Level
+}
+
+// Tracker keeps the previous sample so that it can report deltas, plus one
+// score per root. It is not safe for concurrent use; the caller owns the
+// locking.
+type Tracker struct {
+	prev  map[int]proc
+	roots map[int]*root
+	last  time.Time
+}
+
+// NewTracker returns a tracker without history. The first Update only records
+// a baseline, so every root starts Idle.
+func NewTracker() *Tracker {
+	return &Tracker{
+		prev:  make(map[int]proc),
+		roots: make(map[int]*root),
+	}
+}
+
+// Update samples /proc and returns the level of every root pid. Roots that are
+// no longer running are dropped, so the level set shrinks with the windows; a
+// root that is running but was spawned since the previous sample is Idle for
+// one tick, because it has no baseline to subtract from.
+func (t *Tracker) Update(roots []int) map[int]Level {
+	now := time.Now()
+	dt := 0.0
+	if !t.last.IsZero() {
+		dt = now.Sub(t.last).Seconds()
+	}
+	t.last = now
+
+	cur, children := scan()
+
+	levels := make(map[int]Level, len(roots))
+	next := make(map[int]*root, len(roots))
+	for _, pid := range roots {
+		r, ok := next[pid]
+		if !ok {
+			r = t.roots[pid]
+			if r == nil {
+				r = &root{}
+			}
+			next[pid] = r
+		}
+		if _, running := cur[pid]; !running {
+			continue
+		}
+
+		ticks := treeDelta(cur, t.prev, children, pid)
+		r.advance(ticks, dt)
+		levels[pid] = r.level
+	}
+
+	t.prev = cur
+	t.roots = next
+	return levels
+}
+
+// advance folds one sample into the window. dt is the wall time since the
+// previous sample, measured rather than assumed so that a late sample cannot
+// inflate the rate.
+func (r *root) advance(ticks uint64, dt float64) {
+	if dt <= 0 {
+		return
+	}
+
+	instant := float64(ticks) / clkTck / dt // cores
+
+	r.samples[r.next] = instant
+	r.next = (r.next + 1) % window
+
+	// A tree over the heavy threshold is Heavy on the spot: a build eating
+	// several cores should be red now, not three samples from now, and work that
+	// large does not need to be filtered.
+	if instant >= heavyEnter {
+		r.level = Heavy
+		return
+	}
+	r.level = levelFor(median(r.samples[:]))
+}
+
+// median returns the middle value of a sample window, which is always full
+// because it starts out as zeroes.
+func median(samples []float64) float64 {
+	sorted := append([]float64(nil), samples...)
+	slices.Sort(sorted)
+	return sorted[len(sorted)/2]
+}
+
+// scan reads one sample of /proc: the parent and the CPU ticks of every process.
+// The returned index maps a pid to its children.
+func scan() (map[int]proc, map[int][]int) {
+	procs := statScan()
+	return procs, index(procs)
+}
+
+func statScan() map[int]proc {
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		log.Warnf("cannot read %s: %s", procRoot, err)
+		return nil
+	}
+
+	procs := make(map[int]proc, len(entries))
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue // not a process entry
+		}
+		p, ok := readStat(pid)
+		if !ok {
+			continue // exited while we were reading it
+		}
+		procs[pid] = p
+	}
+	return procs
+}
+
+// readStat parses the fields of /proc/<pid>/stat that are not the command
+// name. Everything up to the last ')' is skipped, so a comm containing spaces
+// or parentheses cannot shift the fields.
+func readStat(pid int) (proc, bool) {
+	b, err := os.ReadFile(fmt.Sprintf("%s/%d/stat", procRoot, pid))
+	if err != nil {
+		return proc{}, false
+	}
+
+	s := string(b)
+	end := strings.LastIndexByte(s, ')')
+	if end < 0 {
+		return proc{}, false
+	}
+	fields := strings.Fields(s[end+1:])
+	// fields[0] is the state, fields[1] the parent pid, fields[11] and
+	// fields[12] utime and stime (see proc(5)).
+	if len(fields) < 13 {
+		return proc{}, false
+	}
+
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return proc{}, false
+	}
+	utime, err := strconv.ParseUint(fields[11], 10, 64)
+	if err != nil {
+		return proc{}, false
+	}
+	stime, err := strconv.ParseUint(fields[12], 10, 64)
+	if err != nil {
+		return proc{}, false
+	}
+
+	return proc{ppid: ppid, ticks: utime + stime}, true
+}
+
+// index maps every process to its children.
+func index(procs map[int]proc) map[int][]int {
+	children := make(map[int][]int)
+	for pid, p := range procs {
+		children[p.ppid] = append(children[p.ppid], pid)
+	}
+	return children
+}
+
+// tree returns a process and all of its descendants, a pid appearing once even
+// if the sample contains a cycle (a cycle is impossible in a live process tree,
+// but a pid recycled between two reads can fake one).
+func tree(children map[int][]int, root int) []int {
+	seen := map[int]bool{root: true}
+	members := []int{root}
+	for i := 0; i < len(members); i++ {
+		for _, child := range children[members[i]] {
+			if seen[child] {
+				continue
+			}
+			seen[child] = true
+			members = append(members, child)
+		}
+	}
+	return members
+}
+
+// treeDelta sums the CPU ticks of a whole tree between two samples. Processes
+// that are missing from the older sample are skipped, not counted in full: their
+// counters are totals for their whole lifetime.
+func treeDelta(cur, prev map[int]proc, children map[int][]int, root int) (ticks uint64) {
+	for _, pid := range tree(children, root) {
+		c, ok := cur[pid]
+		if !ok {
+			continue
+		}
+		p, ok := prev[pid]
+		if !ok {
+			continue
+		}
+		ticks += counterDelta(p.ticks, c.ticks)
+	}
+	return ticks
+}
+
+// counterDelta returns the increase of a monotonic counter. A counter that went
+// backwards belongs to a recycled pid, and reporting its whole value as an
+// increase would fake a burst of work, so it counts as nothing.
+func counterDelta(before, after uint64) uint64 {
+	if after < before {
+		return 0
+	}
+	return after - before
+}
