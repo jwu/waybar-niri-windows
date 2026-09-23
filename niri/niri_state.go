@@ -1,6 +1,7 @@
 package niri
 
 import (
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -77,16 +78,34 @@ func (s *State) Update(event Event) {
 			}
 		}
 	case *WindowOpenedOrChanged:
-		s.needsRedraw = true
 		window := event.Window
-		s.windows[window.Id] = &window
-		if window.IsFocused && window.Id != s.currentWindowId {
-			log.Tracef("  newly focused window: %d", event.Window.Id)
+		existing, exists := s.windows[window.Id]
+		if !exists {
+			s.windows[window.Id] = &window
+			existing = &window
+			s.needsRedraw = true
+		} else {
+			// Only rebuild the widgets when something the minimap actually
+			// draws changed. Apps that re-set their window title (a terminal
+			// spinner, a browser playing media, ...) fire this event many
+			// times a second; each rebuild destroys and recreates the tile
+			// under the cursor, which drops its GTK :hover prelight and reads
+			// as flicker.
+			if drawingRelevant(existing, &window) {
+				s.needsRedraw = true
+			}
+			// Update in place: tile tooltips hold this pointer, so replacing
+			// it would freeze their title until the next real redraw.
+			*existing = window
+		}
+
+		if existing.IsFocused && existing.Id != s.currentWindowId {
+			log.Tracef("  newly focused window: %d", existing.Id)
 			for _, w := range s.windows {
 				w.IsFocused = false
 			}
-			window.IsFocused = true
-			s.currentWindowId = window.Id
+			existing.IsFocused = true
+			s.currentWindowId = existing.Id
 			s.needsRedraw = true
 		}
 	case *WorkspaceActivated:
@@ -192,6 +211,17 @@ func (s *State) Update(event Event) {
 	}
 
 	log.Tracef("processed event: %T\n", event)
+}
+
+// drawingRelevant reports whether a window change affects the minimap layout.
+// Title changes are ignored on purpose (see the WindowOpenedOrChanged case);
+// pid and focus timestamp are never drawn either.
+func drawingRelevant(old, new *Window) bool {
+	a, b := *old, *new
+	a.Title, b.Title = nil, nil
+	a.Pid, b.Pid = nil, nil
+	a.FocusTimestamp, b.FocusTimestamp = nil, nil
+	return !reflect.DeepEqual(a, b)
 }
 
 const urgentBegin = "<span color=\"#fb2c36\">"
