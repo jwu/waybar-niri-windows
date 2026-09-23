@@ -1,6 +1,7 @@
 package module
 
 import (
+	"maps"
 	"slices"
 	"strconv"
 	"time"
@@ -83,12 +84,22 @@ func (i *Instance) sampleActivity() {
 	levels := i.tracker.Update(processes(windows))
 	byWindow := levelsByWindow(windows, levels)
 
+	// Walk the bar only when something changed. A level that is already on a
+	// tile costs nothing to re-apply, but walking hands GTK a fresh set of
+	// widget wrappers to finalize on every tick, and a level set is stable for
+	// minutes at a time in an idle session. A rebuild in the meantime has
+	// applied the levels itself, so skipping the walk cannot leave a tile
+	// stale.
 	i.mu.Lock()
+	changed := !maps.Equal(i.levels, byWindow)
 	i.levels = byWindow
 	i.mu.Unlock()
 
 	log.Tracef("activity: %d windows, %v", len(byWindow), levels)
 
+	if !changed {
+		return
+	}
 	glib.IdleAdd(i.applyActivity)
 }
 
