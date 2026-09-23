@@ -3,6 +3,7 @@ package overview
 import (
 	"fmt"
 	"math"
+	"wnw/procs"
 
 	"github.com/gotk3/gotk3/cairo"
 	"github.com/gotk3/gotk3/pango"
@@ -52,8 +53,10 @@ type Theme struct {
 	Text    RGBA
 	TextDim RGBA
 
-	Busy RGBA
-	Red  RGBA
+	// Activity is the colour of the marker a working window gets; a window
+	// that only worked recently gets the same colour, faded.
+	Activity RGBA
+	Red      RGBA
 
 	HeaderIcon RGBA
 	HeaderText RGBA
@@ -87,8 +90,8 @@ func DefaultTheme() *Theme {
 		Text:    hex(0xd7dae0, 1),
 		TextDim: hex(0x8b93a1, 1),
 
-		Busy: hex(0x98c379, 1),
-		Red:  hex(0xe86671, 1),
+		Activity: hex(0x98c379, 1),
+		Red:      hex(0xe86671, 1),
 
 		HeaderIcon: hex(0x61afef, 1),
 		HeaderText: hex(0xc8cdd6, 1),
@@ -226,12 +229,26 @@ func (r *renderer) drawTile(tile Tile) {
 	r.cr.SetDash(nil, 0)
 
 	r.drawTileText(tile)
+	r.drawActivity(tile)
+}
 
-	if tile.Busy {
-		r.cr.Arc(tile.X+tile.W-10, tile.Y+10, 4, 0, 2*math.Pi)
-		r.theme.Busy.set(r.cr)
-		r.cr.Fill()
+// drawActivity marks a tile whose window is working with a dot: solid while it
+// is, faded while it only worked recently. Nothing else in the picture says
+// what a window is doing, since focus and the active workspace are
+// deliberately not drawn on a lock screen.
+func (r *renderer) drawActivity(tile Tile) {
+	if tile.Activity == procs.Idle || tile.W < 24 || tile.H < 24 {
+		return
 	}
+
+	colour := r.theme.Activity
+	if tile.Activity == procs.Warm {
+		colour = colour.alpha(0.4)
+	}
+
+	r.cr.Arc(tile.X+tile.W-10, tile.Y+10, 4, 0, 2*math.Pi)
+	colour.set(r.cr)
+	r.cr.Fill()
 }
 
 func (r *renderer) drawTileText(tile Tile) {

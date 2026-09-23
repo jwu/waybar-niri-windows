@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"wnw/niri"
+	"wnw/procs"
 )
 
 // Rect is a rectangle in canvas pixels (logical, before any supersampling).
@@ -22,8 +23,9 @@ type Tile struct {
 	Urgent bool
 	// Floating is drawn with a dashed border.
 	Floating bool
-	// Busy is set by the live view when the window's title changed recently.
-	Busy bool
+	// Activity is how recently the window's process tree was working, measured
+	// from /proc by package procs. Idle draws no marker.
+	Activity procs.Level
 }
 
 // Panel is one workspace (its background plus its windows).
