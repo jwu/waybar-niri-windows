@@ -45,6 +45,14 @@ type Instance struct {
 	allocatedHeight int
 	config          Config
 
+	// The state versions the tiles in the bar were built from, and whether they
+	// have been built at all. A redraw whose layout version did not move is
+	// drawn by moving the focus marker instead of rebuilding the tiles. See
+	// Update.
+	layoutVersion uint64
+	focusVersion  uint64
+	built         bool
+
 	// Activity of the windows the tiles belong to, keyed by window id, and the
 	// sampler that fills it in. See activity.go.
 	tracker      *procs.Tracker
@@ -262,7 +270,30 @@ func (i *Instance) Update() {
 		return
 	}
 
+	// Read the versions before the window list: asking for the newest windows
+	// while remembering an older version only rebuilds once more than needed,
+	// while the other order would remember a version that was never drawn.
+	layout, focus := i.niriState.Versions()
 	tiled, floating := i.niriState.Windows(i.monitor)
+
+	// A redraw that did not move a tile only has to move the focus marker onto
+	// the tile that gained it. Rebuilding for a focus change would restart the
+	// stylesheet's background transition on every tile that carries an activity
+	// colour — the minimap flashes grey and fades back over 75 ms — and drop the
+	// hover state of the tile under the cursor.
+	//
+	// The allocated height is part of the test because a first build that ran
+	// before the bar had a size produced tiles without one, and only a rebuild
+	// measures the bar again.
+	if i.built && i.allocatedHeight != 0 && layout == i.layoutVersion {
+		if focus == i.focusVersion {
+			return
+		}
+		i.focusVersion = focus
+		i.markFocusedTiles(tiled, floating)
+		return
+	}
+	i.layoutVersion, i.focusVersion, i.built = layout, focus, true
 
 	i.box.GetChildren().Foreach(func(child any) {
 		w := child.(*gtk.Widget)
@@ -329,6 +360,7 @@ func (i *Instance) Update() {
 				} else if !window.IsUrgent && style.HasClass("urgent") {
 					style.RemoveClass("urgent")
 				}
+				i.colorTile(windowBox.ToWidget())
 				if window.IsFocused {
 					windowBox.SetStateFlags(gtk.STATE_FLAG_ACTIVE, false)
 					colBox.SetStateFlags(gtk.STATE_FLAG_ACTIVE, false)
@@ -355,10 +387,75 @@ func (i *Instance) Update() {
 		}
 	}
 
+	// The levels go on the tiles while they are being built, not afterwards: see
+	// colorTile. Showing the bar is the last thing this function does.
 	i.box.ShowAll()
+}
 
-	// Show the levels sampled while the tiles were being built.
-	i.applyActivityLocked()
+// markFocusedTiles moves the focus marker onto the tiles of the focused windows
+// and takes it off every other tile, without touching the tiles themselves.
+//
+// Widgets are found by walking the bar rather than through stored references:
+// every tile carries its window id as its name, which is how the activity walk
+// finds them too, so nothing has to be kept in sync across a rebuild.
+func (i *Instance) markFocusedTiles(tiled, floating []*niri.Window) {
+	focused := make(map[uint64]bool, len(tiled)+len(floating))
+	for _, windows := range [][]*niri.Window{tiled, floating} {
+		for _, window := range windows {
+			focused[window.Id] = window.IsFocused
+		}
+	}
+
+	// The bar holds the columns, and next to them the floating view, whose own
+	// marker drawFloating is responsible for.
+	i.box.GetChildren().Foreach(func(child any) {
+		view := child.(*gtk.Widget)
+		if name, err := view.GetName(); err == nil && name == floatingViewName {
+			return
+		}
+		// Each child of that box is one column of tiles.
+		containerOf(view).GetChildren().Foreach(func(child any) {
+			column := child.(*gtk.Widget)
+			setActive(column, markTiles(containerOf(column), focused))
+		})
+	})
+
+	if i.floatingView != nil {
+		tiles := containerOf(i.floatingFixed.ToWidget())
+		setActive(i.floatingView.ToWidget(), markTiles(tiles, focused))
+	}
+}
+
+// markTiles marks the tiles in a container that holds them — a column, or the
+// fixed the floating windows sit in — and reports whether one of them is
+// focused.
+func markTiles(parent *gtk.Container, focused map[uint64]bool) bool {
+	anyFocused := false
+	parent.GetChildren().Foreach(func(child any) {
+		tile := child.(*gtk.Widget)
+		name, err := tile.GetName()
+		if err != nil {
+			return
+		}
+		id, err := strconv.ParseUint(name, 10, 64)
+		if err != nil {
+			return
+		}
+		active := focused[id]
+		setActive(tile, active)
+		anyFocused = anyFocused || active
+	})
+	return anyFocused
+}
+
+// setActive turns a widget's focus marker on or off. :active is what the
+// stylesheet draws the marker with.
+func setActive(widget *gtk.Widget, active bool) {
+	if active {
+		widget.SetStateFlags(gtk.STATE_FLAG_ACTIVE, false)
+		return
+	}
+	widget.UnsetStateFlags(gtk.STATE_FLAG_ACTIVE)
 }
 
 func (i *Instance) shouldShowFloating(floating []*niri.Window) bool {
@@ -453,6 +550,7 @@ func (i *Instance) drawFloating(maxWidth int, maxHeight int, floating []*niri.Wi
 		if window.IsUrgent {
 			style.AddClass("urgent")
 		}
+		i.colorTile(windowBox.ToWidget())
 
 		x, y, w, h := i.getFloatingLayout(window, scale, maxWidth, maxHeight)
 		i.floatingFixed.Put(windowBox, x, y)

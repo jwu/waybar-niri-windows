@@ -19,7 +19,14 @@ type State struct {
 	windows            map[uint64]*Window
 	onUpdate           map[uint64]func(*State)
 
-	needsRedraw bool
+	// Counters telling a module how much of what it draws an event
+	// invalidated. A module remembers the pair it last drew from (see
+	// Versions) and rebuilds its tiles only when the layout moved: a redraw
+	// that only moved the focus marker is drawn by moving that marker, because
+	// rebuilding the tiles for a focus change is what makes the minimap blink.
+	// See module.Instance.Update.
+	layoutVersion uint64
+	focusVersion  uint64
 }
 
 // NewNiriState initializes a new NiriState with empty maps for workspaces and windows.
@@ -29,7 +36,6 @@ func NewNiriState() *State {
 		currentWindowId:    None,
 		workspaces:         make(map[uint64]*Workspace),
 		windows:            make(map[uint64]*Window),
-		needsRedraw:        false,
 		onUpdate:           make(map[uint64]func(*State)),
 	}
 }
@@ -47,20 +53,24 @@ func (s *State) RemoveOnUpdate(id uint64) {
 }
 
 func (s *State) Update(event Event) {
+	// The focus version this event started from, so that the notify below can
+	// tell whether it invalidated anything a module draws.
+	var before uint64
+
 	defer func() {
 		// Snapshot the callbacks and release the lock before running them:
 		// callbacks take locks of their own (e.g. the module instance lock),
 		// and a concurrent Deinit holding that lock waits for s.mu, which
 		// deadlocks if the callbacks run while s.mu is still held.
 		s.mu.RLock()
-		if !s.needsRedraw {
+		if s.focusVersion == before {
 			// Only notify the modules when this event actually changed
 			// something they draw. Without this gate every event (including a
 			// window title being re-set, a keyboard-layout switch, a config
-			// reload, ...) queued a rebuild, and Instance.Update() destroys and
-			// recreates every tile. Recreating the tile under the cursor drops
-			// its GTK :hover prelight, which is what a title spinner in a
-			// terminal turns into visible flicker.
+			// reload, ...) queued a redraw, and Instance.Update() used to
+			// destroy and recreate every tile for each of them. Recreating the
+			// tile under the cursor drops its GTK :hover prelight, which is what
+			// a title spinner in a terminal turns into visible flicker.
 			s.mu.RUnlock()
 			return
 		}
@@ -79,7 +89,7 @@ func (s *State) Update(event Event) {
 	defer s.mu.Unlock()
 
 	log.Tracef("received event: %T", event)
-	s.needsRedraw = false
+	before = s.focusVersion
 	switch event := event.(type) {
 	case *WorkspacesChanged:
 		s.workspaces = make(map[uint64]*Workspace)
@@ -88,7 +98,7 @@ func (s *State) Update(event Event) {
 			if wk.IsFocused && wk.Id != s.currentWorkspaceId {
 				log.Tracef("  newly focused workspace: %d", wk.Id)
 				s.currentWorkspaceId = wk.Id
-				s.needsRedraw = true
+				s.markLayout()
 			}
 		}
 	case *WindowOpenedOrChanged:
@@ -97,7 +107,7 @@ func (s *State) Update(event Event) {
 		if !exists {
 			s.windows[window.Id] = &window
 			existing = &window
-			s.needsRedraw = true
+			s.markLayout()
 		} else {
 			// Only rebuild the widgets when something the minimap actually
 			// draws changed. Apps that re-set their window title (a terminal
@@ -106,7 +116,7 @@ func (s *State) Update(event Event) {
 			// under the cursor, which drops its GTK :hover prelight and reads
 			// as flicker.
 			if drawingRelevant(existing, &window) {
-				s.needsRedraw = true
+				s.markLayout()
 			}
 			// Update in place: tile tooltips hold this pointer, so replacing
 			// it would freeze their title until the next real redraw.
@@ -120,10 +130,10 @@ func (s *State) Update(event Event) {
 			}
 			existing.IsFocused = true
 			s.currentWindowId = existing.Id
-			s.needsRedraw = true
+			s.markFocus()
 		}
 	case *WorkspaceActivated:
-		s.needsRedraw = true
+		s.markLayout()
 		wk, ok := s.workspaces[event.Id]
 		if !ok {
 			log.Errorf("workspace %d not found", event.Id)
@@ -152,7 +162,7 @@ func (s *State) Update(event Event) {
 			wk.IsFocused = true
 		}
 	case *WindowFocusChanged:
-		s.needsRedraw = true
+		s.markFocus()
 		if event.Id != nil {
 			log.Tracef("  window focus changed: %d -> %d", s.currentWindowId, *event.Id)
 			// unset focus for all windows
@@ -186,19 +196,19 @@ func (s *State) Update(event Event) {
 			log.Tracef("  focused window closed: %d", event.Id)
 			s.currentWindowId = None
 		}
-		s.needsRedraw = true
+		s.markLayout()
 	case *WindowLayoutsChanged:
-		s.needsRedraw = true
+		s.markLayout()
 		for _, change := range event.Changes {
 			window := s.windows[change.Id]
 			window.Layout = change.WindowLayout
 			if window.WorkspaceId != nil && *window.WorkspaceId == s.currentWorkspaceId {
 				log.Tracef("  window layout on current workspace changed: %d", change.Id)
-				s.needsRedraw = true
+				s.markLayout()
 			}
 		}
 	case *WindowsChanged:
-		s.needsRedraw = true
+		s.markLayout()
 		for _, window := range event.Windows {
 			w := window
 			s.windows[window.Id] = &w
@@ -211,13 +221,13 @@ func (s *State) Update(event Event) {
 		window := s.windows[event.Id]
 		if window != nil {
 			window.IsUrgent = event.Urgent
-			s.needsRedraw = true
+			s.markLayout()
 		}
 	case *WorkspaceUrgencyChanged:
 		workspace := s.workspaces[event.Id]
 		if workspace != nil {
 			workspace.IsUrgent = event.Urgent
-			s.needsRedraw = true
+			s.markLayout()
 		}
 	default:
 		log.Tracef("ignoring event: %T\n", event)
@@ -225,6 +235,28 @@ func (s *State) Update(event Event) {
 	}
 
 	log.Tracef("processed event: %T\n", event)
+}
+
+// markLayout records that an event changed the tiles themselves, so that they
+// have to be laid out again. The caller holds s.mu.
+func (s *State) markLayout() {
+	s.layoutVersion++
+	s.focusVersion++
+}
+
+// markFocus records that an event only moved the focus marker. The caller holds
+// s.mu.
+func (s *State) markFocus() {
+	s.focusVersion++
+}
+
+// Versions returns the counters a module compares against the ones it last drew
+// from. layout changes whenever the tiles themselves changed, focus whenever
+// only the focus marker moved.
+func (s *State) Versions() (layout, focus uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.layoutVersion, s.focusVersion
 }
 
 // drawingRelevant reports whether a window change affects the minimap layout.

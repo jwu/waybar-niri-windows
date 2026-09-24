@@ -179,6 +179,20 @@ func containerOf(widget *gtk.Widget) *gtk.Container {
 	return &gtk.Container{Widget: *widget}
 }
 
+// colorTile puts the activity level of the tile's window on the tile before the
+// tile joins a container. Both tile builders have to call it at that point: GTK
+// computes a widget's style when it is realized, and a widget added to a
+// container that is already realized is realized by that add. A class that
+// arrives after the container has seen the tile is a style change, which the
+// stylesheet's 75 ms background transition animates, so every coloured tile
+// would fade in from grey after a rebuild — the flash.
+//
+// A tile that a later sample gives a new level instead changes its class on
+// purpose, and is meant to fade.
+func (i *Instance) colorTile(tile *gtk.Widget) {
+	setTileLevel(tile, i.levels)
+}
+
 // setTileLevel puts the level of a tile's window on the tile, and reports
 // whether the widget was a tile at all. A tile is recognised by its name: the
 // module names every tile after its window id, so that walking the bar needs

@@ -8,6 +8,8 @@ import (
 
 func strptr(s string) *string { return &s }
 
+func u64(v uint64) *uint64 { return &v }
+
 func windowFixture() *Window {
 	workspaceId := uint64(1)
 	return &Window{
@@ -23,15 +25,16 @@ func windowFixture() *Window {
 	}
 }
 
-func TestTitleOnlyChangeDoesNotNeedRedraw(t *testing.T) {
+func TestTitleOnlyChangeDoesNotNeedARedraw(t *testing.T) {
 	s := NewNiriState()
 	s.Update(&WindowOpenedOrChanged{Window: *windowFixture()})
+	layout, focus := s.Versions()
 
 	changed := windowFixture()
 	changed.Title = strptr("⠙ π - jwu")
 	s.Update(&WindowOpenedOrChanged{Window: *changed})
 
-	if s.needsRedraw {
+	if gotLayout, gotFocus := s.Versions(); gotLayout != layout || gotFocus != focus {
 		t.Fatal("title-only change must not request a redraw (it causes hover flicker)")
 	}
 	if got := *s.windows[42].Title; got != "⠙ π - jwu" {
@@ -39,7 +42,7 @@ func TestTitleOnlyChangeDoesNotNeedRedraw(t *testing.T) {
 	}
 }
 
-func TestRedrawTriggers(t *testing.T) {
+func TestLayoutChangeNeedsARebuild(t *testing.T) {
 	cases := map[string]func(w *Window){
 		"layout moved":  func(w *Window) { w.Layout.PosInScrollingLayout = &Vec2[uint32]{X: 2, Y: 1} },
 		"tile resized":  func(w *Window) { w.Layout.TileSize = Vec2[float64]{X: 900, Y: 1200} },
@@ -56,35 +59,46 @@ func TestRedrawTriggers(t *testing.T) {
 
 			changed := windowFixture()
 			mutate(changed)
+			layout, _ := s.Versions()
 			s.Update(&WindowOpenedOrChanged{Window: *changed})
 
-			if !s.needsRedraw {
-				t.Fatal("change must request a redraw")
+			if got, _ := s.Versions(); got == layout {
+				t.Fatal("change must request a rebuild of the tiles")
 			}
 		})
 	}
 }
 
-func TestNewWindowNeedsRedraw(t *testing.T) {
+func TestNewWindowNeedsARebuild(t *testing.T) {
 	s := NewNiriState()
 	s.Update(&WindowOpenedOrChanged{Window: *windowFixture()})
 
-	if !s.needsRedraw {
-		t.Fatal("a brand new window must request a redraw")
+	if layout, _ := s.Versions(); layout == 0 {
+		t.Fatal("a brand new window must request a rebuild")
 	}
 }
 
-func TestFocusChangeNeedsRedraw(t *testing.T) {
+// The marker has to move when the focus does, but the tiles must not be
+// rebuilt for it: a rebuild destroys and recreates every tile, and the
+// stylesheet's 75 ms background transition then fades each of them from the
+// plain .tile colour, which is the flash on every focus switch.
+func TestFocusChangeMovesTheMarkerWithoutARebuild(t *testing.T) {
 	s := NewNiriState()
 	s.Update(&WindowOpenedOrChanged{Window: *windowFixture()})
 
 	second := windowFixture()
 	second.Id = 43
-	second.IsFocused = true
 	s.Update(&WindowOpenedOrChanged{Window: *second})
+	built, _ := s.Versions()
 
-	if !s.needsRedraw {
-		t.Fatal("focus change must request a redraw")
+	s.Update(&WindowFocusChanged{Id: u64(43)})
+
+	layout, focus := s.Versions()
+	if layout != built {
+		t.Fatal("focus change must not request a rebuild of the tiles")
+	}
+	if focus == built {
+		t.Fatal("focus change must move the focus marker")
 	}
 	if !s.windows[43].IsFocused || s.windows[42].IsFocused {
 		t.Fatal("focus flags not updated")
@@ -112,11 +126,18 @@ func TestCallbacksOnlyFireForDrawingRelevantEvents(t *testing.T) {
 		t.Fatalf("unrelated event notified modules %d time(s)", calls)
 	}
 
+	// A focus change does not rebuild the tiles, but the modules still have to
+	// hear about it: that is what moves the marker.
+	s.Update(&WindowFocusChanged{Id: u64(42)})
+	if calls != 1 {
+		t.Fatalf("focus change notified modules %d time(s), want 1", calls)
+	}
+
 	moved := windowFixture()
 	moved.Layout.PosInScrollingLayout = &Vec2[uint32]{X: 2, Y: 1}
 	s.Update(&WindowOpenedOrChanged{Window: *moved})
-	if calls != 1 {
-		t.Fatalf("relevant change notified modules %d time(s), want 1", calls)
+	if calls != 2 {
+		t.Fatalf("relevant change notified modules %d time(s), want 2", calls)
 	}
 }
 
