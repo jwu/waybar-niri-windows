@@ -19,8 +19,8 @@ import (
 // near its baseline CPU cost and still shows a window that starts working
 // within a second or two.
 //
-// A second bar costs a second scan: the tracker belongs to the instance. See
-// docs/waybar.md.
+// A second bar costs a second scan: the tracker, and the announced pids, belong
+// to the instance. See docs/waybar.md.
 const activityInterval = time.Second
 
 // activityClasses are the classes a tile can carry, from least to most active.
@@ -67,7 +67,8 @@ func (i *Instance) stopActivity() {
 // It runs concurrently with a redraw, so it reads the instance fields under
 // the instance lock and lets the niri state take its own lock afterwards:
 // holding one while taking the other would invert the order the state
-// callbacks use and deadlock the bar.
+// callbacks use and deadlock the bar. The tracker and the announced pids are
+// the sampler's own, and are only touched here.
 func (i *Instance) sampleActivity() {
 	i.mu.RLock()
 	ready := i.ready
@@ -81,8 +82,15 @@ func (i *Instance) sampleActivity() {
 	tiled, floating := i.niriState.Windows(monitor)
 
 	windows := slices.Concat(tiled, floating)
-	levels := i.tracker.Update(processes(windows))
-	byWindow := levelsByWindow(windows, levels)
+
+	// Titles are read before the sample, because a shell announces the pid of
+	// its window in the title (see marker.go): the announcement is what lets a
+	// tile follow one window of a single-instance terminal instead of the
+	// terminal's whole process tree.
+	roots, pidOfWindow := i.announcements.roots(windows)
+	levels := i.tracker.Update(roots)
+	byWindow := levelsByWindow(windows, pidOfWindow, levels)
+	i.announcements.flush()
 
 	// Walk the bar only when something changed. A level that is already on a
 	// tile costs nothing to re-apply, but walking hands GTK a fresh set of
@@ -95,7 +103,7 @@ func (i *Instance) sampleActivity() {
 	i.levels = byWindow
 	i.mu.Unlock()
 
-	log.Tracef("activity: %d windows, %v", len(byWindow), levels)
+	log.Tracef("activity: %d windows measured by %v, levels %v", len(byWindow), pidOfWindow, levels)
 
 	if !changed {
 		return
@@ -103,35 +111,24 @@ func (i *Instance) sampleActivity() {
 	glib.IdleAdd(i.applyActivity)
 }
 
-// processes returns the pid of every window, each once: the tracker keys its
-// scores by pid, so a process that owns several windows must not be sampled
-// twice. Windows whose process id niri does not know are skipped.
-func processes(windows []*niri.Window) []int {
-	pids := make([]int, 0, len(windows))
-	seen := make(map[int]bool, len(windows))
-	for _, window := range windows {
-		if window.Pid == nil || seen[int(*window.Pid)] {
-			continue
-		}
-		seen[int(*window.Pid)] = true
-		pids = append(pids, int(*window.Pid))
-	}
-	return pids
-}
-
-// levelsByWindow spreads the level of a process over the windows it owns. A
-// process can own several windows (two windows of one terminal, every window
-// of a browser), and they all report the activity of one tree: the pid in the
-// niri reply is as fine-grained as this gets.
-func levelsByWindow(windows []*niri.Window, levels map[int]procs.Level) map[uint64]procs.Level {
+// levelsByWindow spreads the level of a pid over the windows that are measured
+// by it. Usually that is one window: a window whose title announced a shell is
+// measured by that shell, which no other window shares. Several windows share a
+// pid when the application is measured instead (every window of a browser, a
+// terminal whose windows did not announce anything), and then they all report
+// the activity of one tree, because the pid in the niri reply is as
+// fine-grained as the fallback gets. A pid the sampler could not measure at all
+// (the process is gone) leaves its windows without a level.
+func levelsByWindow(windows []*niri.Window, pidOfWindow map[uint64]int, levels map[int]procs.Level) map[uint64]procs.Level {
 	byWindow := make(map[uint64]procs.Level, len(windows))
 	for _, window := range windows {
-		if window.Pid == nil {
+		pid, ok := pidOfWindow[window.Id]
+		if !ok {
 			continue
 		}
-		level, ok := levels[int(*window.Pid)]
+		level, ok := levels[pid]
 		if !ok {
-			continue // the process is gone
+			continue
 		}
 		byWindow[window.Id] = level
 	}

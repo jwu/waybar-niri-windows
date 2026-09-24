@@ -238,6 +238,43 @@ func TestScanSeesChildren(t *testing.T) {
 	}
 }
 
+func TestAliveAndDescendant(t *testing.T) {
+	pid, ppid := os.Getpid(), os.Getppid()
+
+	if !Alive(pid) {
+		t.Errorf("Alive(%d) = false for this process", pid)
+	}
+	// Pids stop at 2^22, so this number is never running.
+	if Alive(1 << 30) {
+		t.Errorf("Alive(%d) = true for a pid that does not exist", 1<<30)
+	}
+
+	// A process is inside its own tree and inside its parent's, but its parent is
+	// not inside the tree of the process it spawned.
+	if !Descendant(pid, pid) {
+		t.Errorf("this process is not a descendant of itself")
+	}
+	if !Descendant(pid, ppid) {
+		t.Errorf("this process is not a descendant of its parent %d", ppid)
+	}
+	if Descendant(ppid, pid) {
+		t.Errorf("the parent of this process descends from it")
+	}
+
+	// The walk, not just one comparison of parents: a grandparent is two levels
+	// up. A process at the top of a pid namespace has no parent to check.
+	if grandparent, ok := readStat(ppid); ok && grandparent.ppid > 0 {
+		if !Descendant(pid, grandparent.ppid) {
+			t.Errorf("this process is not a descendant of its grandparent %d", grandparent.ppid)
+		}
+	}
+
+	// A pid that is not running is inside no tree, in either direction.
+	if Descendant(1<<30, pid) || Descendant(pid, 1<<30) {
+		t.Errorf("a pid that does not exist is inside someone's tree")
+	}
+}
+
 var burnSink uint64
 
 func burn() {

@@ -329,3 +329,38 @@ func counterDelta(before, after uint64) uint64 {
 	}
 	return after - before
 }
+
+// Alive reports whether a process still exists.
+func Alive(pid int) bool {
+	_, ok := readStat(pid)
+	return ok
+}
+
+// Descendant reports whether pid is root or one of its descendants.
+//
+// The module uses it to check a pid a shell announced in a window title: the
+// announced pid has to run inside the window's own process tree, or measuring it
+// would report one window's work on a tile that belongs to another. A pid that
+// has exited, or a number recycled by an unrelated process, fails the check.
+func Descendant(pid, root int) bool {
+	if root <= 0 {
+		return false
+	}
+
+	// A window's process tree is a handful of levels deep, and the bound stops a
+	// cycle: a pid recycled between two reads of /proc can claim any parent.
+	for depth := 0; depth < 64; depth++ {
+		if pid == root {
+			return true
+		}
+		p, ok := readStat(pid)
+		if !ok {
+			return false // exited, or never existed
+		}
+		if p.ppid == pid || p.ppid <= 0 {
+			return false // pid 1 (or a faked cycle) is as far as the chain goes
+		}
+		pid = p.ppid
+	}
+	return false
+}

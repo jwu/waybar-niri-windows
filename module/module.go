@@ -51,6 +51,11 @@ type Instance struct {
 	levels       map[uint64]procs.Level
 	activityDone chan struct{}
 	activityWg   sync.WaitGroup
+
+	// The pids shells announced in window titles, which the sampler learns from
+	// and remembers for later runs of the bar. The sampler owns it. See
+	// announcement.go.
+	announcements *announcementCache
 }
 
 func (i *Instance) Id() uintptr {
@@ -67,11 +72,12 @@ const floatingViewName = "floating"
 
 func New(niriState *niri.State, niriSocket niri.Socket, queueUpdate func()) *Instance {
 	return &Instance{
-		id:          uintptr(rand.Uint64()),
-		queueUpdate: queueUpdate,
-		niriState:   niriState,
-		niriSocket:  niriSocket,
-		tracker:     procs.NewTracker(),
+		id:            uintptr(rand.Uint64()),
+		queueUpdate:   queueUpdate,
+		niriState:     niriState,
+		niriSocket:    niriSocket,
+		tracker:       procs.NewTracker(),
+		announcements: newAnnouncementCache(defaultAnnouncementPath()),
 		config: Config{
 			Mode:              GraphicalMode,
 			ShowFloating:      ShowFloatingAuto,
@@ -508,13 +514,21 @@ func (i *Instance) applyWindowRules(windowBox *gtk.EventBox, window *niri.Window
 		safeDestroy(child.(*gtk.Widget))
 	})
 
+	// Rules match the title the window shows. A shell's announcement is not part
+	// of it: it is invisible tag characters this module asked for, and a rule
+	// anchored at the end of a title must not see them. See marker.go.
+	var title string
+	if window.Title != nil {
+		title = stripMarker(*window.Title)
+	}
+
 	for _, rule := range i.config.WindowRules {
 		appIdMatched := rule.AppId == nil
 		titleMatched := rule.Title == nil
 		if rule.AppId != nil && window.AppId != nil && rule.AppId.MatchString(*window.AppId) {
 			appIdMatched = true
 		}
-		if rule.Title != nil && window.Title != nil && rule.Title.MatchString(*window.Title) {
+		if rule.Title != nil && window.Title != nil && rule.Title.MatchString(title) {
 			titleMatched = true
 		}
 		if appIdMatched && titleMatched {
@@ -553,7 +567,7 @@ func (*Instance) connectTooltip(windowBox gtk.IWidget, window *niri.Window) {
 	windowBox.ToWidget().SetProperty("has-tooltip", true)
 	windowBox.ToWidget().Connect("query-tooltip", func(obj gtk.IWidget, x, y int, keyboardTip bool, tooltip *gtk.Tooltip) bool {
 		if window.Title != nil {
-			tooltip.SetText(*window.Title)
+			tooltip.SetText(stripMarker(*window.Title))
 			return true
 		}
 
